@@ -4,10 +4,12 @@ This Visual Studio Code extension allows you to copy the structure of your repos
 
 ## Features
 
-- Copies the entire structure of your repository to the clipboard
-- Includes file contents in the copied structure
-- Respects `.repoignore` rules for excluding files and directories
-- Provides a token count for the copied structure
+- Works across all folders in multi-root workspaces
+- Lets you preview and select files before exporting
+- Shows progress with the ability to cancel long operations
+- Respects `.repoignore`, `.gitignore` and VS Code's `files.exclude`
+- Copies to clipboard or saves the output to a file
+- Provides a token count for the final selection
 
 ## Usage
 
@@ -20,9 +22,11 @@ This Visual Studio Code extension allows you to copy the structure of your repos
    - Type "Copy Repository Structure" and select the command
 4. The repository structure will be copied to your clipboard, and you'll see a notification with the token count
 
-## .repoignore
+## Ignoring files
 
 Create a `.repoignore` file in the root of your repository to specify files and directories to exclude. The syntax is similar to `.gitignore`.
+
+The extension also falls back to `.gitignore` and VS Code's `files.exclude` setting so common temporary or build artifacts are skipped automatically.
 
 Example `.repoignore`:
 
@@ -31,8 +35,6 @@ node_modules
 *.log
 .vscode
 ```
-
-If no `.repoignore` file is found, a warning will be shown, and no files will be ignored.
 
 ## Token Count
 

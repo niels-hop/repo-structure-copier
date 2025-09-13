@@ -1,87 +1,169 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import * as tiktoken from 'tiktoken';
 import ignore from 'ignore';
+import * as tiktoken from 'tiktoken';
 
+/**
+ * RepoStructureCopier collects file contents from all workspace folders and allows the
+ * user to review and export the combined structure. It supports ignore rules from
+ * `.repoignore`, `.gitignore` and VS Code's `files.exclude` setting.
+ */
 class RepoStructureCopier {
-    private ig: ReturnType<typeof ignore> | null = null;
+    private ig = ignore();
 
-    async copyRepoStructure() {
-        const rootPath = this.getRootPath();
-        if (!rootPath) {
+    async run() {
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length === 0) {
+            vscode.window.showErrorMessage('No workspace folder open');
             return;
         }
 
-        this.ig = await this.parseRepoIgnore(rootPath);
-        const structure = await this.traverseDirectory(rootPath);
-        const tokenCount = this.countTokens(structure);
-        const formattedTokenCount = this.formatTokenCount(tokenCount);
+        await this.loadIgnoreRules(folders);
 
-        await vscode.env.clipboard.writeText(structure);
-        vscode.window.showInformationMessage(`Repository structure copied to clipboard. Token count: ${formattedTokenCount}`);
+        const tokenSource = new vscode.CancellationTokenSource();
+
+        await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                cancellable: true,
+                title: 'Collecting repository structure…'
+            },
+            async (progress, token) => {
+                token.onCancellationRequested(() => tokenSource.cancel());
+                const items = await this.collectFileItems(folders, tokenSource.token);
+                if (tokenSource.token.isCancellationRequested) {
+                    return;
+                }
+
+                const selection = await vscode.window.showQuickPick(items, {
+                    canPickMany: true,
+                    placeHolder: 'Select files to include'
+                });
+                if (!selection || selection.length === 0) {
+                    return;
+                }
+
+                const structure = this.buildStructure(selection);
+                const totalTokens = selection.reduce((sum, item) => sum + (item.tokenCount ?? 0), 0);
+                const formattedTokenCount = this.formatTokenCount(totalTokens);
+
+                const outputChoice = await vscode.window.showQuickPick(
+                    ['Copy to clipboard', 'Save to file'],
+                    { placeHolder: 'Select output option' }
+                );
+                if (!outputChoice) {
+                    return;
+                }
+
+                if (outputChoice === 'Copy to clipboard') {
+                    await vscode.env.clipboard.writeText(structure);
+                } else {
+                    const uri = await vscode.window.showSaveDialog({ filters: { 'Text Files': ['txt'] } });
+                    if (uri) {
+                        await fs.writeFile(uri.fsPath, structure, 'utf8');
+                    } else {
+                        return;
+                    }
+                }
+
+                vscode.window.showInformationMessage(
+                    `Repository structure processed. Token count: ${formattedTokenCount}`
+                );
+            }
+        );
     }
 
-    private getRootPath(): string | null {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (!workspaceFolders) {
-            vscode.window.showErrorMessage('No workspace folder open');
-            return null;
+    private async loadIgnoreRules(folders: readonly vscode.WorkspaceFolder[]) {
+        for (const folder of folders) {
+            const repoignore = path.join(folder.uri.fsPath, '.repoignore');
+            const gitignore = path.join(folder.uri.fsPath, '.gitignore');
+            for (const file of [repoignore, gitignore]) {
+                try {
+                    const content = await fs.readFile(file, 'utf8');
+                    this.ig.add(content);
+                } catch {
+                    // ignore missing files
+                }
+            }
         }
-        return workspaceFolders[0].uri.fsPath;
-    }
-
-    private async parseRepoIgnore(rootPath: string): Promise<ReturnType<typeof ignore>> {
-        const ig = ignore();
-        const repoignorePath = path.join(rootPath, '.repoignore');
-        
-        try {
-            const repoignoreContent = await fs.readFile(repoignorePath, 'utf8');
-            ig.add(repoignoreContent);
-        } catch (error) {
-            vscode.window.showWarningMessage('No .repoignore file found. No files will be ignored.');
+        const filesExclude = vscode.workspace
+            .getConfiguration('files')
+            .get<Record<string, boolean>>('exclude', {});
+        for (const [pattern, enabled] of Object.entries(filesExclude)) {
+            if (enabled) {
+                this.ig.add(pattern);
+            }
         }
-        
-        return ig;
     }
 
-    private shouldIgnore(filePath: string, rootPath: string): boolean {
-        if (!this.ig) {
-            return false;
+    private async collectFileItems(
+        folders: readonly vscode.WorkspaceFolder[],
+        token: vscode.CancellationToken
+    ) {
+        const items: FileItem[] = [];
+        for (const folder of folders) {
+            const files = await this.walk(folder.uri.fsPath, folder.uri.fsPath, token);
+            for (const file of files) {
+                if (token.isCancellationRequested) {
+                    break;
+                }
+                const content = await fs.readFile(file, 'utf8');
+                const tokenCount = this.countTokens(content);
+                items.push({
+                    label: file,
+                    description: `${tokenCount} tokens`,
+                    tokenCount,
+                    content
+                });
+            }
         }
-        
-        const relativePath = path.relative(rootPath, filePath);
-        return this.ig.ignores(relativePath);
+        return items;
     }
 
-    private async traverseDirectory(dir: string, rootPath: string = dir): Promise<string> {
-        let result = '<codebase>';
-        const files = await fs.readdir(dir);
-        
-        for (const file of files) {
-            const filePath = path.join(dir, file);
-            const stat = await fs.stat(filePath);
-            
-            if (this.shouldIgnore(filePath, rootPath)) {
+    private async walk(
+        dir: string,
+        root: string,
+        token: vscode.CancellationToken,
+        collected: string[] = []
+    ): Promise<string[]> {
+        if (token.isCancellationRequested) {
+            return collected;
+        }
+
+        const entries = await fs.readdir(dir);
+        for (const entry of entries) {
+            const full = path.join(dir, entry);
+            const rel = path.relative(root, full);
+            if (this.ig.ignores(rel)) {
                 continue;
             }
-            
+            const stat = await fs.stat(full);
             if (stat.isDirectory()) {
-                result += await this.traverseDirectory(filePath, rootPath);
+                await this.walk(full, root, token, collected);
             } else {
-                const content = await fs.readFile(filePath, 'utf8');
-                result += `<file><path>${filePath}</path><content>${content}</content></file>`;
+                collected.push(full);
+            }
+            if (token.isCancellationRequested) {
+                break;
             }
         }
-        
+        return collected;
+    }
+
+    private buildStructure(selected: FileItem[]): string {
+        let result = '<codebase>';
+        for (const item of selected) {
+            result += `<file><path>${item.label}</path><content>${item.content}</content></file>`;
+        }
         result += '</codebase>';
         return result;
     }
 
     private countTokens(text: string): number {
-        const encoding = tiktoken.encoding_for_model("gpt-4");
-        const tokens = encoding.encode(text);
-        encoding.free();
+        const enc = tiktoken.encoding_for_model('gpt-4');
+        const tokens = enc.encode(text);
+        enc.free();
         return tokens.length;
     }
 
@@ -90,10 +172,17 @@ class RepoStructureCopier {
     }
 }
 
+interface FileItem extends vscode.QuickPickItem {
+    content: string;
+    tokenCount?: number;
+}
+
 export function activate(context: vscode.ExtensionContext) {
-    const repoStructureCopier = new RepoStructureCopier();
-    let disposable = vscode.commands.registerCommand('extension.copyRepoStructure', () => repoStructureCopier.copyRepoStructure());
-    context.subscriptions.push(disposable);
+    const copier = new RepoStructureCopier();
+    context.subscriptions.push(
+        vscode.commands.registerCommand('extension.copyRepoStructure', () => copier.run())
+    );
 }
 
 export function deactivate() {}
+
